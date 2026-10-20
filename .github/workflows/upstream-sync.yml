@@ -55,6 +55,8 @@ jobs:
     needs: mirror
     if: needs.mirror.outputs.behind == 'true'
     runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Shanghai   # 4 remark-recovery tests assume the host is on China time (prod is)
     outputs:
       result: ${{ steps.run.outputs.result }}
     steps:
@@ -69,7 +71,7 @@ jobs:
       - name: Install candidate
         run: |
           python -m pip install -U pip
-          python -m pip install -e ".[redis,msgpack,dev]" pandas
+          python -m pip install -e ".[redis,msgpack,mysql,dev]" pandas
       - name: Run the bridge's offline suite
         id: run
         run: |
