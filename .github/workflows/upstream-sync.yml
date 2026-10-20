@@ -1,0 +1,113 @@
+name: upstream-sync
+
+# Daily upgrade candidate from litaolemo/xtquant_big_convert.
+#   1. mirror upstream/main -> upstream-main (and push upstream tags)
+#   2. run the bridge's own offline test suite on that candidate
+#   3. open or refresh a pull request upstream-main -> main with the result
+# Merging the pull request is the human upgrade gate for this fork.
+# The OMS repo (XtQuantServer) bumps its pinned tag separately, only after
+# its own bridge contract tests pass against the candidate.
+
+on:
+  schedule:
+    - cron: "30 22 * * *"   # 06:30 Asia/Shanghai, before the trading day
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    outputs:
+      behind: ${{ steps.cmp.outputs.behind }}
+      upstream_sha: ${{ steps.cmp.outputs.upstream_sha }}
+      upstream_tag: ${{ steps.cmp.outputs.upstream_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/litaolemo/xtquant_big_convert.git
+          git fetch upstream main --tags
+      - name: Mirror upstream/main to upstream-main and push tags
+        run: |
+          git push --force origin upstream/main:refs/heads/upstream-main
+          git push origin --tags
+      - name: Compare candidate with main
+        id: cmp
+        run: |
+          sha=$(git rev-parse --short upstream/main)
+          tag=$(git describe --tags --exact-match upstream/main 2>/dev/null || git describe --tags upstream/main)
+          if git merge-base --is-ancestor upstream/main origin/main; then behind=false; else behind=true; fi
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "upstream_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "main behind upstream: $behind ($tag @ $sha)"
+
+  test-candidate:
+    needs: mirror
+    if: needs.mirror.outputs.behind == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.run.outputs.result }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: upstream-main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install redis-server (some suites spawn a local one)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq redis-server
+      - name: Install candidate
+        run: |
+          python -m pip install -U pip
+          python -m pip install -e ".[redis,msgpack,dev]" pandas
+      - name: Run the bridge's offline suite
+        id: run
+        run: |
+          set +e
+          python run_all_tests.py | tee suite.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -eq 0 ]; then echo "result=PASS" >> "$GITHUB_OUTPUT"; else echo "result=FAIL" >> "$GITHUB_OUTPUT"; fi
+          exit 0   # the outcome is reported in the pull request; it never blocks the mirror
+      - uses: actions/upload-artifact@v4
+        with:
+          name: suite-log-${{ needs.mirror.outputs.upstream_sha }}
+          path: suite.log
+          retention-days: 14
+
+  pull-request:
+    needs: [mirror, test-candidate]
+    if: needs.mirror.outputs.behind == 'true'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UP_TAG: ${{ needs.mirror.outputs.upstream_tag }}
+      UP_SHA: ${{ needs.mirror.outputs.upstream_sha }}
+      SUITE: ${{ needs.test-candidate.outputs.result }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open or refresh the upgrade pull request
+        run: |
+          title="upgrade: upstream ${UP_TAG} (offline suite: ${SUITE})"
+          body=$(printf '%s\n' \
+            "Daily upgrade candidate from litaolemo/xtquant_big_convert." \
+            "" \
+            "- upstream: ${UP_TAG} (${UP_SHA})" \
+            "- bridge offline suite on ubuntu / Python 3.12: **${SUITE}** (log in this run's artifacts)" \
+            "" \
+            "Merging updates this fork's main. XtQuantServer bumps its pinned tag only after its own bridge contract tests pass against this candidate.")
+          n=$(gh pr list --head upstream-main --base main --state open --json number --jq '.[0].number')
+          if [ -z "$n" ]; then
+            gh pr create --head upstream-main --base main --title "$title" --body "$body"
+          else
+            gh pr edit "$n" --title "$title" --body "$body"
+          fi
