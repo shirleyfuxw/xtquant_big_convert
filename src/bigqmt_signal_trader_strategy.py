@@ -1265,6 +1265,11 @@ def _apply_gil_tuning():
 
 
 def init(ContextInfo):
+    try:
+        from bigqmt_signal_trader.logging_setup import install_panel_capture
+        install_panel_capture()
+    except Exception:
+        pass
     detected_account_id = _detect_account_id(ContextInfo)
     if detected_account_id and not _account_id:
         set_account_id(detected_account_id)

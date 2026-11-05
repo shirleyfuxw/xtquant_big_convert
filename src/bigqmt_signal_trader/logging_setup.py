@@ -16,16 +16,18 @@ Behavior:
 - Log directory resolves to ``<qmt_python_dir>/logs`` when running inside QMT
   (found via a sys.path entry ending in ``\\python``), else ``~/.cache/bigqmt/logs``.
 - Rotates at midnight into ``bigqmt.log.YYYY-MM-DD`` backups, keeping the last
-  7 days by default (override with env BIGQMT_LOG_RETENTION_DAYS).
+  30 days by default (override with env BIGQMT_LOG_RETENTION_DAYS).
 - Each record is also printed to stdout so the QMT output panel still shows it.
 - Thread-safe (logging is; the print side is best-effort wrapped).
 - Never raises: a logging failure must not bring down the strategy.
 - Opt out via env BIGQMT_LOG_ENABLED=0 / BIGQMT_LOG_TO_STDOUT=0.
 """
 
+import builtins
 import datetime as _dt
 import os
 import sys
+import threading
 import time
 import traceback
 
@@ -40,6 +42,8 @@ except ImportError:
 
 _LOGGER_NAME = "bigqmt"
 _initialized = False
+_DEFAULT_RETENTION_DAYS = 30
+_panel_state = threading.local()
 
 
 def _env_bool(name, default=True):
@@ -85,10 +89,15 @@ if logging is not None:
         """print() the record so the QMT output panel shows it; never raises."""
 
         def emit(self, record):
+            # The file handler already has this record; keep the panel tee
+            # from writing it a second time.
+            _panel_state.busy = True
             try:
                 print(self.format(record))
             except Exception:
                 pass
+            finally:
+                _panel_state.busy = False
 
 
 class _FallbackLogger:
@@ -116,10 +125,13 @@ class _FallbackLogger:
                 except Exception:
                     pass
         if _env_bool("BIGQMT_LOG_TO_STDOUT", True):
+            _panel_state.busy = True
             try:
                 print(line)
             except Exception:
                 pass
+            finally:
+                _panel_state.busy = False
 
     def debug(self, message, *args):
         self._write("DEBUG", message, args)
@@ -135,6 +147,13 @@ class _FallbackLogger:
 
     def exception(self, message, *args):
         self._write("ERROR", message, args, traceback.format_exc())
+
+
+def _retention_days():
+    try:
+        return int(os.environ.get("BIGQMT_LOG_RETENTION_DAYS", _DEFAULT_RETENTION_DAYS))
+    except (TypeError, ValueError):
+        return _DEFAULT_RETENTION_DAYS
 
 
 def _cleanup_old_logs(log_dir, retention_days):
@@ -251,7 +270,7 @@ def _setup():
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # File handler: rotate at midnight, keep the last 7 days only.
+    # File handler: rotate at midnight, keep the retention window only.
     log_dir = _resolve_log_dir()
     if log_dir is not None:
         try:
@@ -260,14 +279,14 @@ def _setup():
                 fname,
                 when="midnight",
                 interval=1,
-                backupCount=int(os.environ.get("BIGQMT_LOG_RETENTION_DAYS", 7)),
+                backupCount=_retention_days(),
                 encoding="utf-8",
                 utc=False,
             )
             file_handler.rotator = _tolerant_rotator
             file_handler.setFormatter(fmt)
             logger.addHandler(file_handler)
-            _cleanup_old_logs(log_dir, int(os.environ.get("BIGQMT_LOG_RETENTION_DAYS", 7)))
+            _cleanup_old_logs(log_dir, _retention_days())
         except Exception:
             pass
 
@@ -320,3 +339,93 @@ def log_file_path():
         return None
     log_dir = _resolve_log_dir()
     return None if log_dir is None else _fallback_path(log_dir)
+
+
+class _PanelTee(object):
+    """sys.stdout wrapper: the panel gets every byte first and unchanged, then
+    each completed line is saved to the log file. Capture can never raise."""
+
+    _bigqmt_panel_tee = True
+
+    def __init__(self, inner, sink):
+        self._bigqmt_inner = inner
+        self._sink = sink
+        self._enabled = True
+        self._pending = threading.local()
+
+    def write(self, text):
+        result = self._bigqmt_inner.write(text)
+        if self._enabled and not getattr(_panel_state, "busy", False):
+            try:
+                self._capture(text)
+            except Exception:
+                pass
+        return result
+
+    def _capture(self, text):
+        pending = getattr(self._pending, "text", "") + str(text)
+        lines = pending.split("\n")
+        rest = lines.pop()
+        if len(rest) > 65536:
+            lines.append(rest)
+            rest = ""
+        self._pending.text = rest
+        for line in lines:
+            line = line.rstrip("\r")
+            if line.strip():
+                self._sink(line)
+
+    def __getattr__(self, name):
+        return getattr(self._bigqmt_inner, name)
+
+
+def _make_panel_sink():
+    if logging is not None:
+        file_handler = _active_file_handler()
+        if file_handler is None:
+            return None
+
+        def sink(line):
+            record = logging.LogRecord("bigqmt.panel", logging.INFO, "", 0, line, None, None)
+            file_handler.handle(record)
+
+        return sink
+    log_dir = _resolve_log_dir()
+    if log_dir is None:
+        return None
+    _cleanup_old_logs(log_dir, _retention_days())
+
+    def fallback_sink(line):
+        stamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(_fallback_path(log_dir), "a") as log_file:
+            log_file.write("%s [INFO] [bigqmt.panel] %s\n" % (stamp, line))
+
+    return fallback_sink
+
+
+def install_panel_capture():
+    """Also save everything print()ed to the QMT panel into the log file.
+
+    Idempotent across strategy reloads: the previous tee is switched off (it is
+    found through ``builtins``, which survives the module purge), so only one
+    writer is ever live. Never raises.
+    """
+    try:
+        _setup()
+        previous = getattr(builtins, "_bigqmt_panel_tee", None)
+        if previous is not None:
+            previous._enabled = False
+        stream = sys.stdout
+        while getattr(stream, "_bigqmt_panel_tee", False):
+            stream = stream._bigqmt_inner
+        sys.stdout = stream
+        if not _env_bool("BIGQMT_LOG_ENABLED", True) or stream is None:
+            return
+        sink = _make_panel_sink()
+        if sink is None:
+            return
+        tee = _PanelTee(stream, sink)
+        builtins._bigqmt_panel_tee = tee
+        sys.stdout = tee
+    except Exception:
+        pass
