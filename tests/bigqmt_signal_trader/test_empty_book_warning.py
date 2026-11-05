@@ -100,3 +100,22 @@ def test_a_broken_quote_shape_never_breaks_get_ticks(env):
     _, log = env
     ticks = _provider({"600000.SH": "not a dict"}).get_ticks(["600000.SH"])
     assert ticks == {"600000.SH": "not a dict"}
+
+
+@pytest.mark.parametrize("quote", [
+    {"lastPrice": 3000.0},
+    {"lastPrice": 0.0, "time": 1},
+    {"lastPrice": 0, "askPrice": [0, 0]},
+    {"lastPrice": 0, "bidPrice": [0, 0]},
+])
+def test_missing_book_keys_stay_silent(env, quote):
+    _, log = env
+    _provider({"000300.SH": quote}).get_ticks(["000300.SH"])
+    assert log.warnings == []
+
+
+def test_present_all_zero_book_still_warns(env):
+    _, log = env
+    _provider({"600000.SH": {"lastPrice": 0, "askPrice": [0, 0], "bidPrice": [0, 0]}}
+              ).get_ticks(["600000.SH"])
+    assert len(log.warnings) == 1

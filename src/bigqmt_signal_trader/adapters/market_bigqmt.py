@@ -1091,6 +1091,8 @@ class BigQmtMarketDataProvider:
             for code, quote in data.items():
                 if not isinstance(quote, dict):
                     continue
+                if "askPrice" not in quote or "bidPrice" not in quote:
+                    continue  # index / non-trading code: no book to be empty
                 if (_has_positive_price(quote.get("askPrice"))
                         or _has_positive_price(quote.get("bidPrice"))):
                     continue
