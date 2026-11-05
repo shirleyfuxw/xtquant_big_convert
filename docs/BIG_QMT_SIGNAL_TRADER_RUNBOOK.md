@@ -317,6 +317,14 @@ configure(mode="bigqmt", account_id=ACCOUNT_ID or "dryrun")
 
 ## 7. 日志排查
 
+桥接自身日志（文件名按资金账号区分，不是 `bigqmt.log`）：
+
+```text
+<QMT_DIR>\python\logs\bigqmt-<资金账号>.log      # 当天；历史为 .log.YYYY-MM-DD，默认保留 30 天
+```
+
+实际路径可在 QMT 里调用 `bigqmt_signal_trader.logging_setup.log_file_path()` 查看。
+
 QMT 公式日志：
 
 ```text

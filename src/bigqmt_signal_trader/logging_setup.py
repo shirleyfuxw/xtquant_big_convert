@@ -111,7 +111,7 @@ class _FallbackLogger:
             log_dir = _resolve_log_dir()
             if log_dir is not None:
                 try:
-                    with open(os.path.join(log_dir, "bigqmt.log"), "a") as log_file:
+                    with open(_fallback_path(log_dir), "a") as log_file:
                         log_file.write(line + "\n")
                 except Exception:
                     pass
@@ -296,10 +296,27 @@ def get_logger(name=""):
     return logging.getLogger(full)
 
 
+def _active_file_handler():
+    for handler in getattr(logging.getLogger(_LOGGER_NAME), "handlers", []):
+        if isinstance(handler, logging.handlers.TimedRotatingFileHandler):
+            return handler
+    return None
+
+
+def _fallback_path(log_dir):
+    """Per-day file for the no-logging-module path (no rotation exists there)."""
+    name = _log_file_name()
+    stem = name[:-4] if name.endswith(".log") else name
+    return os.path.join(log_dir, "%s-%s.log" % (stem, _dt.date.today().strftime("%Y%m%d")))
+
+
 def log_file_path():
-    """Return the current log file path (or None if file logging is off)."""
+    """Return the file the bridge is writing right now (None if file logging is off)."""
     _setup()
-    log_dir = _resolve_log_dir()
-    if log_dir is None:
+    if logging is not None:
+        handler = _active_file_handler()
+        return handler.baseFilename if handler is not None else None
+    if not _env_bool("BIGQMT_LOG_ENABLED", True):
         return None
-    return os.path.join(log_dir, "bigqmt.log")
+    log_dir = _resolve_log_dir()
+    return None if log_dir is None else _fallback_path(log_dir)
