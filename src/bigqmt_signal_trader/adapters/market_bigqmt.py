@@ -39,6 +39,23 @@ from ..quote_utils import find_code_payload, is_option_code, latest_quote_row
 log = get_logger("market")
 
 
+EMPTY_BOOK_WARN_SECONDS = 60.0
+
+
+def _has_positive_price(value):
+    try:
+        items = value if isinstance(value, (list, tuple)) else list(value)
+    except TypeError:
+        items = [value]
+    for item in items:
+        try:
+            if float(item) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def _ignore_tick_push(data):
     """Callback for the #310 warm-up subscriptions: the snapshot is read back
     with get_full_tick, so the pushes themselves are not needed."""
@@ -1040,6 +1057,8 @@ class BigQmtMarketDataProvider:
                         missing_options, exc,
                     )
 
+        self._warn_empty_books(data)
+
         # Map any answer key back to the caller's spelling when the two differ
         # only by case. Keyed on the upper-cased form deliberately: we now send
         # the caller's own spelling, so this must work whether QMT echoes that
@@ -1059,6 +1078,35 @@ class BigQmtMarketDataProvider:
             (original_by_upper.get(str(key).upper(), key), value)
             for key, value in data.items()
         )
+
+    def _warn_empty_books(self, data):
+        """One line per code per minute when a quote has no price on EITHER side.
+
+        A stock at its limit has one empty side and that is normal, so only a
+        book that is empty on both sides is reported. Never raises.
+        """
+        try:
+            now = time.monotonic()
+            last_warned = self.__dict__.setdefault("_empty_book_warned", {})
+            for code, quote in data.items():
+                if not isinstance(quote, dict):
+                    continue
+                if "askPrice" not in quote or "bidPrice" not in quote:
+                    continue  # index / non-trading code: no book to be empty
+                if (_has_positive_price(quote.get("askPrice"))
+                        or _has_positive_price(quote.get("bidPrice"))):
+                    continue
+                if now - last_warned.get(code, -EMPTY_BOOK_WARN_SECONDS) < EMPTY_BOOK_WARN_SECONDS:
+                    continue
+                if len(last_warned) > 10000:
+                    last_warned.clear()
+                last_warned[code] = now
+                log.warning(
+                    "empty book code=%s tick_time=%s lastPrice=%s askPrice=%s bidPrice=%s",
+                    code, quote.get("timetag", quote.get("time")),
+                    quote.get("lastPrice"), quote.get("askPrice"), quote.get("bidPrice"))
+        except Exception:
+            pass
 
     # Issue #310: on Jianghai big-QMT 2.1.19.0, ContextInfo.get_full_tick
     # answers only codes that hold a live quote subscription. An unsubscribed
